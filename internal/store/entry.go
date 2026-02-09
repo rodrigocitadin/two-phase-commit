@@ -11,7 +11,7 @@ const (
 	ABORTED  TransactionState = "ABORTED"
 )
 
-type Entry struct {
+type entry struct {
 	TxID  uuid.UUID
 	State TransactionState
 	Value int
