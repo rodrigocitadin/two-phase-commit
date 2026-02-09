@@ -2,13 +2,13 @@ package store
 
 import "github.com/google/uuid"
 
-type TransactionState string
+type TransactionState uint8
 
 const (
-	STARTED  TransactionState = "STARTED"
-	PREPARED TransactionState = "PREPARED"
-	COMMITED TransactionState = "COMMITED"
-	ABORTED  TransactionState = "ABORTED"
+	STARTED   TransactionState = 1
+	PREPARED  TransactionState = 2
+	COMMITTED TransactionState = 3
+	ABORTED   TransactionState = 4
 )
 
 type entry struct {
