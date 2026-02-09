@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/google/uuid"
+	"github.com/rodrigocitadin/two-phase-commit/internal/store"
 )
 
 type Node interface {
@@ -19,28 +20,26 @@ type Node interface {
 }
 
 type node struct {
-	id      int
-	address string
-	peers   []Peer
-	state   int
+	id            int
+	address       string
+	peers         []Peer
+	stableStore   store.StableStore
+	volatileStore store.VolatileStore
 }
 
 func (n *node) commit(transactionID uuid.UUID, value, senderID int) error {
-	newState := n.state + value
-	// read new state from log in final version
-	// write decision log
 
-	n.state = newState
+	// write to stable
 	return nil
 }
 
 func (n *node) prepare(transactionID uuid.UUID, value, senderID int) error {
-	// write prepare log with new state
+	// write to stable
 	return nil
 }
 
 func (n *node) State() int {
-	return n.state
+	return n.volatileStore.State()
 }
 
 func (n *node) checkResult(result []Result[bool]) bool {
@@ -71,7 +70,7 @@ func (n *node) Transaction(value int) error {
 		return errors.New("Someone rejected the transaction")
 	}
 
-	newState := n.state + value
+	// newState := n.state + value
 
 	// write decision log
 
@@ -88,7 +87,7 @@ func (n *node) Transaction(value int) error {
 		return errors.New("Someone rejected the commit")
 	}
 
-	n.state = newState
+	// n.state = newState
 
 	return nil
 }
@@ -105,10 +104,19 @@ func NewNode(id int, nodes map[int]string) (Node, error) {
 		}
 	}
 
+	stableStore, err := store.NewStableStore(id)
+	if err != nil {
+		return nil, err
+	}
+
+	volatileStore := store.NewVolatileStore(0)
+
 	n := &node{
-		id:      id,
-		address: address,
-		peers:   peers,
+		id:            id,
+		address:       address,
+		peers:         peers,
+		stableStore:   stableStore,
+		volatileStore: volatileStore,
 	}
 
 	nodeRPC := newNodeRPC(n)
