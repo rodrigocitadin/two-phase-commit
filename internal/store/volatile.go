@@ -17,7 +17,7 @@ type VolatileStore interface {
 type volatileStore struct {
 	mu            sync.RWMutex
 	locked        bool
-	lockedByTx    *uuid.UUID
+	lockedByTx    uuid.UUID
 	state         int
 	proposedValue int
 }
@@ -31,14 +31,14 @@ func (vs *volatileStore) Prepare(txID uuid.UUID, newState int) error {
 	defer vs.mu.Unlock()
 
 	if vs.locked {
-		if vs.lockedByTx == &txID {
+		if vs.lockedByTx == txID {
 			return nil
 		}
 		return errors.New("node is locked by another transaction")
 	}
 
 	vs.locked = true
-	vs.lockedByTx = &txID
+	vs.lockedByTx = txID
 	vs.proposedValue = newState
 
 	return nil
@@ -48,13 +48,13 @@ func (vs *volatileStore) Commit(txID uuid.UUID) error {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	if !vs.locked || vs.lockedByTx != &txID {
+	if !vs.locked || vs.lockedByTx != txID {
 		return errors.New("invalid transaction commit")
 	}
 
 	vs.state = vs.proposedValue
 	vs.locked = false
-	vs.lockedByTx = nil
+	vs.lockedByTx = uuid.Nil
 
 	return nil
 }
@@ -63,12 +63,12 @@ func (vs *volatileStore) Abort(txID uuid.UUID) error {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	if !vs.locked || vs.lockedByTx != &txID {
+	if !vs.locked || vs.lockedByTx != txID {
 		return nil
 	}
 
 	vs.locked = false
-	vs.lockedByTx = nil
+	vs.lockedByTx = uuid.Nil
 
 	return nil
 }
