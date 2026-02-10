@@ -1,15 +1,21 @@
 package internal
 
 import (
+	"errors"
+	"net"
 	"net/rpc"
+	"sync"
+	"time"
 )
 
 type Peer interface {
 	ID() int
 	Call(method string, args, reply any) error
+	Close() error
 }
 
 type peer struct {
+	mu      sync.Mutex
 	id      int
 	address string
 	client  *rpc.Client
@@ -19,23 +25,42 @@ func (p *peer) ID() int {
 	return p.id
 }
 
+func (p *peer) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.client != nil {
+		return p.client.Close()
+	}
+	return nil
+}
+
 func (p *peer) Call(method string, args any, reply any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.client == nil {
-		c, err := rpc.Dial("tcp", p.address)
+		conn, err := net.DialTimeout("tcp", p.address, 2*time.Second)
 		if err != nil {
 			return err
 		}
-		p.client = c
+		p.client = rpc.NewClient(conn)
 	}
 
-	err := p.client.Call(method, args, reply)
+	call := p.client.Go(method, args, reply, nil)
 
-	if err == rpc.ErrShutdown {
+	select {
+	case <-call.Done:
+		if call.Error == rpc.ErrShutdown {
+			p.client.Close()
+			p.client = nil
+		}
+		return call.Error
+
+	case <-time.After(5 * time.Second):
 		p.client.Close()
 		p.client = nil
+		return errors.New("rpc call timed out")
 	}
-
-	return err
 }
 
 func NewPeer(id int, address string) Peer {
@@ -44,4 +69,3 @@ func NewPeer(id int, address string) Peer {
 		address: address,
 	}
 }
-

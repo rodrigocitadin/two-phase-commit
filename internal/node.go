@@ -14,6 +14,7 @@ import (
 type Node interface {
 	Transaction(value int) error
 	State() int
+	Close() error
 
 	prepare(txID uuid.UUID, value, senderID int) error
 	commit(txID uuid.UUID, value, senderID int) error
@@ -29,6 +30,33 @@ type node struct {
 	peers         []Peer
 	stableStore   store.StableStore
 	volatileStore store.VolatileStore
+	listener      net.Listener
+}
+
+func (n *node) Close() error {
+	var errs []error
+
+	if n.listener != nil {
+		if err := n.listener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	for _, p := range n.peers {
+		if err := p.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if err := n.stableStore.Close(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return errs[0]
+	}
+
+	return nil
 }
 
 func (n *node) getStatus(txID uuid.UUID) (store.TransactionState, error) {
@@ -221,12 +249,18 @@ func NewNode(id int, nodes map[int]string) (Node, error) {
 
 	volatileStore := store.NewVolatileStore(0)
 
+	l, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+
 	n := &node{
 		id:            id,
 		address:       address,
 		peers:         peers,
 		stableStore:   stableStore,
 		volatileStore: volatileStore,
+		listener:      l,
 	}
 
 	if err := n.recover(); err != nil {
@@ -238,14 +272,12 @@ func NewNode(id int, nodes map[int]string) (Node, error) {
 	server := rpc.NewServer()
 	server.RegisterName("Node", nodeRPC)
 
-	l, err := net.Listen("tcp", address)
-	if err != nil {
-		return nil, err
-	}
-
 	go func() {
 		for {
-			conn, _ := l.Accept()
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
 			go server.ServeConn(conn)
 		}
 	}()

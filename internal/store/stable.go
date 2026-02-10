@@ -20,6 +20,7 @@ type StableStore interface {
 	Truncate() error
 	GetTransactionState(txID uuid.UUID) (TransactionState, error)
 	ReplayLog(callback func(Entry) error) error
+	Close() error
 }
 
 type SnapshotData struct {
