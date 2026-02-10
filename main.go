@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/rodrigocitadin/two-phase-commit/internal"
@@ -28,6 +29,14 @@ func main() {
 	}
 
 	nodes[0].Transaction(1)
-	nodes[0].Transaction(1)
-	nodes[0].Transaction(1)
+	fmt.Println("\n--- end of transaction ---\n")
+
+	nodes[1].Transaction(1)
+	fmt.Println("\n--- end of transaction ---\n")
+
+	nodes[3].Transaction(1)
+	fmt.Println("\n--- end of transaction ---\n")
+
+	nodes[2].Transaction(1)
+	fmt.Println("\n--- end of transaction ---\n")
 }

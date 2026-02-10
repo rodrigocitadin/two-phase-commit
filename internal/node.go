@@ -276,7 +276,7 @@ func NewNode(id int, nodes map[int]string) (Node, error) {
 	port := 3000 + id
 	address := "localhost:" + strconv.Itoa(port)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	logger = logger.With("node_id", id)
 
 	peers := make([]Peer, 0, len(nodes))
