@@ -127,3 +127,9 @@ Key tests included in `internal/node_test.go`:
 * `TestCoordinatorCrashAfterDecision`: The coordinator crashes after logging COMMIT; participants stay blocked while it is down and commit once it is back.
 * `TestRecoveryKeepsInDoubtTransaction`: An unrelated ABORT logged after an in-doubt PREPARED does not hide it during recovery.
 * `TestGetStatus_PendingWhileCollectingVotes` and `TestLatePrepareAfterAbortIsRejected`.
+
+Fault injection (`internal/faults_test.go`): every link goes through a `faultyNet` that can drop requests, drop replies, duplicate or delay calls, and every WAL through a `faultyStore` that can fail appends. Tests cover a participant or coordinator that cannot log, lost commit acks, lost commits (learned via `GetStatus`), duplicated messages, a PREPARE arriving after the abort and a crash between snapshot and truncate. `internal/edge_test.go` covers RPC idempotency, single node clusters, concurrent transactions on the same node and shutdown.
+
+`TestChaos` (`internal/chaos_test.go`) runs concurrent transactions while nodes crash at random points and the network misbehaves, then heals everything and checks that every transaction has the same outcome on every node and that every node applied each commit exactly once. It logs its seed; rerun with `CHAOS_SEED=<seed>`.
+
+`make fuzz` fuzzes the WAL decoder and replay (torn or corrupted logs must never panic or misalign the log).

@@ -33,6 +33,10 @@ type Config struct {
 	// decision and how often an in-doubt participant asks for it.
 	RetryInterval time.Duration
 	Logger        *slog.Logger
+
+	// Test hooks to inject network and disk faults.
+	wrapPeer  func(p Peer) Peer
+	wrapStore func(s store.StableStore) store.StableStore
 }
 
 // crashPoint names a step of Transaction where tests can simulate a crash.
@@ -594,14 +598,22 @@ func newNode(cfg Config) (*node, error) {
 
 	peers := make([]Peer, 0, len(cfg.Nodes))
 	for peerID, peerAddress := range cfg.Nodes {
-		if peerID != cfg.ID {
-			peers = append(peers, NewPeer(peerID, peerAddress, cfg.RPCTimeout, logger))
+		if peerID == cfg.ID {
+			continue
 		}
+		p := NewPeer(peerID, peerAddress, cfg.RPCTimeout, logger)
+		if cfg.wrapPeer != nil {
+			p = cfg.wrapPeer(p)
+		}
+		peers = append(peers, p)
 	}
 
 	stableStore, err := store.NewStableStore(cfg.DataDir, cfg.ID)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.wrapStore != nil {
+		stableStore = cfg.wrapStore(stableStore)
 	}
 
 	n := &node{

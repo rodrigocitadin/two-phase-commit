@@ -75,12 +75,23 @@ func (p *peer) reset(client *rpc.Client) {
 	client.Close()
 }
 
-// Call does not hold the lock while waiting, so calls to the same peer can
-// run concurrently (rpc.Client is safe for that) and Close never blocks.
+// Call retries once on a broken connection, typically left by a peer that
+// restarted since the last call. That is safe because every RPC of the
+// protocol is idempotent.
 func (p *peer) Call(method string, args any, reply any) error {
+	broken, err := p.call(method, args, reply)
+	if broken {
+		_, err = p.call(method, args, reply)
+	}
+	return err
+}
+
+// call does not hold the lock while waiting, so calls to the same peer can
+// run concurrently (rpc.Client is safe for that) and Close never blocks.
+func (p *peer) call(method string, args any, reply any) (broken bool, err error) {
 	client, err := p.getClient()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	call := client.Go(method, args, reply, make(chan *rpc.Call, 1))
@@ -94,13 +105,14 @@ func (p *peer) Call(method string, args any, reply any) error {
 			// Connection level failure (peer restarted, EOF, shutdown...).
 			p.logger.Warn("RPC connection failed, resetting client", "error", call.Error)
 			p.reset(client)
+			return true, call.Error
 		}
-		return call.Error
+		return false, call.Error
 
 	case <-timer.C:
 		p.logger.Warn("RPC call timed out, closing connection")
 		p.reset(client)
-		return errors.New("rpc call timed out")
+		return false, errors.New("rpc call timed out")
 	}
 }
 

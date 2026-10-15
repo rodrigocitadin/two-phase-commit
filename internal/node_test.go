@@ -3,7 +3,9 @@ package internal
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -17,16 +19,27 @@ var testLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Le
 
 // cluster runs nodes firstID..firstID+size-1 on ports 3000+id, sharing a
 // temporary data directory that survives node restarts within the test.
+// Every link goes through net and every WAL through disks[id], so tests can
+// inject faults.
 type cluster struct {
 	t     *testing.T
 	dir   string
 	addrs map[int]string
 	ids   []int
 	nodes map[int]*node
+	net   *faultyNet
+	disks map[int]*faultyStore
 }
 
 func newCluster(t *testing.T, firstID, size int) *cluster {
-	c := &cluster{t: t, dir: t.TempDir(), addrs: map[int]string{}, nodes: map[int]*node{}}
+	c := &cluster{
+		t:     t,
+		dir:   t.TempDir(),
+		addrs: map[int]string{},
+		nodes: map[int]*node{},
+		net:   newFaultyNet(),
+		disks: map[int]*faultyStore{},
+	}
 	for i := range size {
 		id := firstID + i
 		c.ids = append(c.ids, id)
@@ -56,6 +69,11 @@ func (c *cluster) start(id int) *node {
 		RPCTimeout:    500 * time.Millisecond,
 		RetryInterval: retryInterval,
 		Logger:        testLogger,
+		wrapPeer:      func(p Peer) Peer { return &faultyPeer{Peer: p, from: id, net: c.net} },
+		wrapStore: func(s store.StableStore) store.StableStore {
+			c.disks[id] = &faultyStore{StableStore: s}
+			return c.disks[id]
+		},
 	})
 	if err != nil {
 		c.t.Fatalf("Failed to start node %d: %v", id, err)
@@ -79,9 +97,40 @@ func (c *cluster) restart(id int) *node {
 	return c.start(id)
 }
 
+// live returns the ids of the running nodes, in order.
+func (c *cluster) live() []int {
+	var ids []int
+	for _, id := range c.ids {
+		if c.nodes[id] != nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// down returns the ids of the crashed nodes, in order.
+func (c *cluster) down() []int {
+	var ids []int
+	for _, id := range c.ids {
+		if c.nodes[id] == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (c *cluster) walPath(id int) string {
+	return filepath.Join(c.dir, fmt.Sprintf("node_%d.wal", id))
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	waitForWithin(t, 5*time.Second, what, cond)
+}
+
+func waitForWithin(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("Timed out waiting for %s", what)
@@ -94,6 +143,12 @@ func (n *node) record(txID uuid.UUID) store.TxRecord {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.txs[txID]
+}
+
+func (n *node) records() map[uuid.UUID]store.TxRecord {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return maps.Clone(n.txs)
 }
 
 func (c *cluster) waitForState(want int) {
