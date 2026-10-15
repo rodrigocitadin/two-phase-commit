@@ -20,7 +20,7 @@ func main() {
 
 	nodes := make([]internal.Node, 0, numberOfNodes)
 	for i := range numberOfNodes {
-		node, err := internal.NewNode(i, nodeAddresses)
+		node, err := internal.NewNode(internal.Config{ID: i, Nodes: nodeAddresses, DataDir: "./logs"})
 		if err != nil {
 			panic(err)
 		}
@@ -28,15 +28,12 @@ func main() {
 		nodes = append(nodes, node)
 	}
 
-	nodes[0].Transaction(1)
-	fmt.Println("\n--- end of transaction ---\n")
+	for _, coordinator := range []int{0, 1, 3, 2} {
+		nodes[coordinator].Transaction(1)
+		fmt.Print("\n--- end of transaction ---\n\n")
+	}
 
-	nodes[1].Transaction(1)
-	fmt.Println("\n--- end of transaction ---\n")
-
-	nodes[3].Transaction(1)
-	fmt.Println("\n--- end of transaction ---\n")
-
-	nodes[2].Transaction(1)
-	fmt.Println("\n--- end of transaction ---\n")
+	for _, n := range nodes {
+		n.Close()
+	}
 }

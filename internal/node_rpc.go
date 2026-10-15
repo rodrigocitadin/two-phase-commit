@@ -19,51 +19,38 @@ type NodeRPC interface {
 }
 
 type nodeRPC struct {
-	parent Node
+	node *node
 }
 
-func (n *nodeRPC) GetStatus(txID uuid.UUID, reply *store.TransactionState) error {
-	state, err := n.parent.getStatus(txID)
-	*reply = state
+// GetStatus answers PREPARED while the coordinator has not decided yet, so
+// the caller must keep waiting.
+func (r *nodeRPC) GetStatus(txID uuid.UUID, reply *store.TransactionState) error {
+	*reply = r.node.getStatus(txID)
+	return nil
+}
+
+func (r *nodeRPC) Abort(args RequestArgs, reply *bool) error {
+	err := r.node.decide(args.TxID, args.SenderID, store.TRANSACTION_ABORTED)
+	*reply = err == nil
 	return err
 }
 
-func (n *nodeRPC) Abort(args RequestArgs, reply *bool) error {
-	err := n.parent.abort(args.TxID, args.SenderID)
-
+func (r *nodeRPC) Prepare(args RequestArgs, reply *bool) error {
+	_, err := r.node.prepare(args.TxID, args.SenderID, func(int) int { return args.Value })
 	if err != nil {
 		*reply = false
-	} else {
-		*reply = true
+		return err
 	}
 
-	return err
+	// We voted YES: from now on only the coordinator can decide, so keep
+	// asking it in case the decision never arrives.
+	r.node.goBackground(func() { r.node.awaitDecision(args.TxID, args.SenderID) })
+	*reply = true
+	return nil
 }
 
-func (n *nodeRPC) Prepare(args RequestArgs, reply *bool) error {
-	err := n.parent.prepare(args.TxID, args.Value, args.SenderID)
-
-	if err != nil {
-		*reply = false
-	} else {
-		*reply = true
-	}
-
+func (r *nodeRPC) Commit(args RequestArgs, reply *bool) error {
+	err := r.node.decide(args.TxID, args.SenderID, store.TRANSACTION_COMMITTED)
+	*reply = err == nil
 	return err
-}
-
-func (n *nodeRPC) Commit(args RequestArgs, reply *bool) error {
-	err := n.parent.commit(args.TxID, args.Value, args.SenderID)
-
-	if err != nil {
-		*reply = false
-	} else {
-		*reply = true
-	}
-
-	return err
-}
-
-func newNodeRPC(n Node) NodeRPC {
-	return &nodeRPC{parent: n}
 }

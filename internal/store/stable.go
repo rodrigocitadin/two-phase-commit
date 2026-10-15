@@ -5,123 +5,124 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/google/uuid"
 )
 
 type StableStore interface {
-	WritePrepared(txID uuid.UUID, value, senderID int) error
-	WriteCommited(txID uuid.UUID, value, senderID int) error
-	WriteAborted(txID uuid.UUID, senderID int) error
-	SaveSnapshot(state int, history map[uuid.UUID]bool) error
-	LoadSnapshot() (*SnapshotData, error)
-	RecoverLastState() (*Entry, error)
-	Truncate() error
-	GetTransactionState(txID uuid.UUID) (TransactionState, error)
+	// Append durably writes e to the WAL (fsync before returning).
+	Append(e Entry) error
+	// ReplayLog calls callback for every entry in the WAL, in order. A torn
+	// record at the end of the log (crash in the middle of a write) is dropped.
 	ReplayLog(callback func(Entry) error) error
+	// SaveSnapshot atomically replaces the snapshot.
+	SaveSnapshot(s Snapshot) error
+	LoadSnapshot() (*Snapshot, error)
+	// Truncate empties the WAL. Only call it after a snapshot that covers it.
+	Truncate() error
 	Close() error
 }
 
-type SnapshotData struct {
+type Snapshot struct {
 	State        int
-	CommittedLog map[uuid.UUID]bool
+	Transactions map[uuid.UUID]TxRecord
 }
 
 type stableStore struct {
-	mu      sync.Mutex
-	nodeID  int
-	file    *os.File
-	encoder *gob.Encoder
+	mu       sync.Mutex
+	file     *os.File
+	size     int64
+	walPath  string
+	snapPath string
+}
+
+func (s *stableStore) Append(e Entry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.file.Write(e.encode()); err != nil {
+		// Drop a partially written record so the log stays aligned.
+		_ = s.file.Truncate(s.size)
+		return err
+	}
+	if err := s.file.Sync(); err != nil {
+		_ = s.file.Truncate(s.size)
+		return err
+	}
+
+	s.size += recordSize
+	return nil
 }
 
 func (s *stableStore) ReplayLog(callback func(Entry) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.file.Seek(0, 0)
+	data, err := io.ReadAll(io.NewSectionReader(s.file, 0, s.size))
 	if err != nil {
 		return err
 	}
 
-	decoder := gob.NewDecoder(s.file)
-	for {
-		var e Entry
-		if err := decoder.Decode(&e); err != nil {
-			if err == io.EOF {
-				break
+	records := len(data) / recordSize
+	valid := 0
+	for i := range records {
+		e, ok := decodeEntry(data[i*recordSize:])
+		if !ok {
+			if i == records-1 {
+				break // torn last record
 			}
-			return err
+			return fmt.Errorf("wal corrupted at offset %d", i*recordSize)
 		}
 		if err := callback(e); err != nil {
 			return err
 		}
+		valid = (i + 1) * recordSize
+	}
+
+	if valid < len(data) {
+		if err := s.file.Truncate(int64(valid)); err != nil {
+			return err
+		}
+		s.size = int64(valid)
 	}
 	return nil
 }
 
-func (s *stableStore) GetTransactionState(txID uuid.UUID) (TransactionState, error) {
+func (s *stableStore) SaveSnapshot(snap Snapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	filename := fmt.Sprintf("./logs/node_%d.wal", s.nodeID)
-	f, err := os.Open(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return TRANSACTION_ABORTED, nil
-		}
-		return 0, err
-	}
-	defer f.Close()
-
-	decoder := gob.NewDecoder(f)
-	// Default to Aborted (Presumed Abort) if not found
-	finalState := TRANSACTION_ABORTED
-
-	for {
-		var e Entry
-		if err := decoder.Decode(&e); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return 0, err
-		}
-
-		if e.TxID == txID {
-			if e.State == TRANSACTION_COMMITTED {
-				finalState = TRANSACTION_COMMITTED
-			}
-		}
-	}
-
-	return finalState, nil
-}
-
-func (s *stableStore) SaveSnapshot(state int, history map[uuid.UUID]bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	filename := fmt.Sprintf("logs/snaps/node_%d.snap", s.nodeID)
-	f, err := os.Create(filename)
+	// Write to a temporary file and rename it over the old snapshot, so a
+	// crash leaves either the old or the new snapshot, never a partial one.
+	tmp := s.snapPath + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	data := SnapshotData{
-		State:        state,
-		CommittedLog: history,
+	if err := gob.NewEncoder(f).Encode(snap); err != nil {
+		f.Close()
+		return err
 	}
-
-	return gob.NewEncoder(f).Encode(data)
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.snapPath); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(s.snapPath))
 }
 
-func (s *stableStore) LoadSnapshot() (*SnapshotData, error) {
+func (s *stableStore) LoadSnapshot() (*Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	filename := fmt.Sprintf("logs/snaps/node_%d.snap", s.nodeID)
-	f, err := os.Open(filename)
+	f, err := os.Open(s.snapPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -130,70 +131,21 @@ func (s *stableStore) LoadSnapshot() (*SnapshotData, error) {
 	}
 	defer f.Close()
 
-	var data SnapshotData
-	if err := gob.NewDecoder(f).Decode(&data); err != nil {
+	var snap Snapshot
+	if err := gob.NewDecoder(f).Decode(&snap); err != nil {
 		return nil, err
 	}
-
-	return &data, nil
-}
-
-func (s *stableStore) RecoverLastState() (*Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var lastState Entry
-	decoder := gob.NewDecoder(s.file)
-
-	for {
-		var current Entry
-		if err := decoder.Decode(&current); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return &lastState, fmt.Errorf("potential corruption at end of log: %w", err)
-		}
-		lastState = current
-	}
-
-	return &lastState, nil
+	return &snap, nil
 }
 
 func (s *stableStore) Truncate() error {
-	return s.file.Truncate(0)
-}
-
-func (s *stableStore) WriteAborted(txID uuid.UUID, senderID int) error {
-	return s.writeLog(Entry{
-		TxID:  txID,
-		State: TRANSACTION_ABORTED,
-	})
-}
-
-func (s *stableStore) WriteCommited(txID uuid.UUID, value, senderID int) error {
-	return s.writeLog(Entry{
-		TxID:  txID,
-		Value: value,
-		State: TRANSACTION_COMMITTED,
-	})
-}
-
-func (s *stableStore) WritePrepared(txID uuid.UUID, value, senderID int) error {
-	return s.writeLog(Entry{
-		TxID:  txID,
-		Value: value,
-		State: TRANSACTION_PREPARED,
-	})
-}
-
-func (s *stableStore) writeLog(entry Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.encoder.Encode(entry); err != nil {
+	if err := s.file.Truncate(0); err != nil {
 		return err
 	}
-
+	s.size = 0
 	return s.file.Sync()
 }
 
@@ -201,25 +153,36 @@ func (s *stableStore) Close() error {
 	return s.file.Close()
 }
 
-func NewStableStore(nodeID int) (StableStore, error) {
-	if err := os.MkdirAll("./logs", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create log directory: %w", err)
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+func NewStableStore(dir string, nodeID int) (StableStore, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	if err := os.MkdirAll("./logs/snaps", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create snaps directory: %w", err)
-	}
-
-	filename := fmt.Sprintf("./logs/node_%d.wal", nodeID)
-
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	walPath := filepath.Join(dir, fmt.Sprintf("node_%d.wal", nodeID))
+	f, err := os.OpenFile(walPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
 
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
 	return &stableStore{
-		file:    f,
-		encoder: gob.NewEncoder(f),
-		nodeID:  nodeID,
+		file:     f,
+		size:     info.Size(),
+		walPath:  walPath,
+		snapPath: filepath.Join(dir, fmt.Sprintf("node_%d.snap", nodeID)),
 	}, nil
 }

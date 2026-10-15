@@ -15,6 +15,8 @@ Two-Phase Commit is a standardized protocol for ensuring that a distributed tran
 
 This implementation also includes **Recovery** mechanisms. If a node crashes, it can rebuild its state and resolve pending transactions by reading its stable log upon restart.
 
+The protocol follows the **presumed abort** variant: a coordinator logs `PREPARED` before asking anyone to prepare, so a transaction it has no record of can only have aborted. Logging the decision (`COMMITTED`/`ABORTED`) is the commit point of the whole transaction.
+
 ## How This Project Implements 2PC
 
 The implementation is divided into core library components (`internal/`) and storage engines (`internal/store/`):
@@ -24,7 +26,9 @@ The implementation is divided into core library components (`internal/`) and sto
 The core entity that acts as both a Coordinator and a Participant. It handles:
 
 * Initiating transactions.
-* Broadcasting `Prepare`, `Commit`, and `Abort` RPCs to peers.
+* Broadcasting `Prepare`, `Commit`, and `Abort` RPCs to peers, and retransmitting the decision until every participant acknowledges it (then it logs `END`).
+* Answering `GetStatus` for the transactions it coordinates (`PREPARED` means "not decided yet, keep waiting").
+* As a participant, asking the coordinator for the outcome while it is in doubt.
 * Handling incoming RPC requests via `NodeRPC`.
 * Recovering state from disk on startup.
 
@@ -33,9 +37,9 @@ The core entity that acts as both a Coordinator and a Participant. It handles:
 
 A persistent storage engine using Write-Ahead Logging (WAL).
 
-* Records transaction states (`PREPARED`, `COMMITTED`, `ABORTED`) to disk before modifying volatile state.
-* Uses `gob` encoding to save logs to `./logs/node_ID.wal`.
-* Supports Snapshots to compact logs and speed up recovery.
+* Records transaction states (`PREPARED`, `COMMITTED`, `ABORTED`, `END`) to disk, with `fsync`, before modifying volatile state.
+* Fixed size binary records with a CRC32 in `<data dir>/node_ID.wal`. A torn record at the end of the log (crash in the middle of a write) is dropped; corruption anywhere else is an error.
+* Snapshots (`<data dir>/node_ID.snap`) are written atomically (temp file + `fsync` + rename) and compact the log on every startup. They keep the in-doubt transactions and the undelivered decisions too.
 
 
 ### Volatile Store (`internal/store/volatile.go`):
@@ -43,7 +47,7 @@ A persistent storage engine using Write-Ahead Logging (WAL).
 Manages the in-memory state machine.
 
 * Handles locking mechanisms to ensure isolation during the Prepare phase.
-* Maintains the current value and the log of committed transaction IDs.
+* Maintains the current value and the value staged by the prepared transaction.
 
 
 ### Cluster Simulation (`main.go`):
@@ -53,9 +57,12 @@ Manages the in-memory state machine.
 
 ## Key Features
 
-* **Crash Recovery**: Nodes replay their WAL on startup to restore the last known consistent state. If a node crashes while `PREPARED`, it contacts the Coordinator to resolve the transaction status.
+* **Crash Recovery**: Nodes replay their snapshot and WAL on startup to restore the last known consistent state, before accepting any RPC. Then:
+  * a participant that was `PREPARED` keeps the lock and asks the coordinator until it gets a decision. It never aborts on its own: the coordinator may have decided `COMMIT`, so it blocks while the coordinator is down (the known cost of 2PC);
+  * a coordinator that crashed before logging a decision aborts and tells the participants;
+  * a coordinator re-delivers every decision not yet acknowledged by all participants.
 * **RPC Communication**: Uses Go's standard `net/rpc` for type-safe peer-to-peer communication.
-* **Timeout Handling**: The Coordinator broadcasts aborts if peers fail to respond within a specific timeout window.
+* **Timeout Handling**: The Coordinator aborts if peers fail to respond within the RPC timeout. Lost decision messages are retransmitted.
 * **Concurrency Control**: Uses `sync.RWMutex` and distinct locking states to prevent race conditions during transaction processing.
 
 ## Project Structure
@@ -67,9 +74,10 @@ Manages the in-memory state machine.
 │   ├── node_rpc.go      # RPC handlers for network requests
 │   ├── broadcast.go     # Helper for broadcasting messages to peers
 │   ├── peer.go          # Client wrapper for dialing other nodes
-│   ├── node_test.go     # Integration tests (Happy path, Abort, Recovery)
+│   ├── node_test.go     # Integration tests (Happy path, Abort, crash points)
 │   └── store/
 │       ├── stable.go    # Disk persistence (WAL & Snapshots)
+│       ├── stable_test.go # WAL & snapshot tests
 │       ├── volatile.go  # In-memory state & Locking
 │       └── entry.go     # Log entry definitions
 ├── logs/                # Generated runtime logs (gitignored)
@@ -95,7 +103,7 @@ make run
 
 ```
 
-*Note: You may need to run `make clean` first if previous log files are causing conflicts, although the system is designed to recover.*
+*Note: the nodes recover from `./logs` on every run, so a second run continues from the previous state. Run `make clean` to start from zero.*
 
 ### Running Tests
 
@@ -106,9 +114,16 @@ make test
 
 ```
 
+Every test runs its own cluster with a temporary data directory. Crashes at precise points of the protocol are simulated with a test hook in `Transaction` (`crashAfterVotes`, `crashAfterDecision`).
+
 Key tests included in `internal/node_test.go`:
 
 * `TestTwoPhaseCommit_HappyPath`: Verifies a standard successful transaction.
 * `TestTwoPhaseCommit_AbortOnPrepareFailure`: Simulates a node rejecting a proposal, causing a cluster-wide abort.
-* `TestNodeRecovery_Persistence`: Writes data, crashes a node, restarts it, and verifies it recovers the correct state from disk.
-* `TestCoordinator_Timeout`: Verifies that the coordinator aborts if a participant is unresponsive.
+* `TestCoordinator_Timeout_HandlesPeerFailure`: Verifies that the coordinator aborts if a participant is unresponsive.
+* `TestNodeRecovery_Persistence`: Writes data, crashes a node, restarts it (twice), and verifies it recovers the correct state from disk.
+* `TestParticipantCrashAfterVoting`: A participant votes YES and crashes; after restarting it commits.
+* `TestCoordinatorCrashBeforeDecision`: The coordinator crashes before deciding; on restart it aborts and releases the participants.
+* `TestCoordinatorCrashAfterDecision`: The coordinator crashes after logging COMMIT; participants stay blocked while it is down and commit once it is back.
+* `TestRecoveryKeepsInDoubtTransaction`: An unrelated ABORT logged after an in-doubt PREPARED does not hide it during recovery.
+* `TestGetStatus_PendingWhileCollectingVotes` and `TestLatePrepareAfterAbortIsRejected`.
